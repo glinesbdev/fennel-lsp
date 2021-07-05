@@ -1,32 +1,19 @@
 (local keywords (require :keywords))
 
 (local types {:arg :ARG
-              :doc :DOCSTRING
-              :fn :FUNC
-              :keyword :KEYWORD
-              :let :VARIABLE
               :lbracket :LBRACKET
               :lcurly :LCURLY
               :lparen :LPAREN
+              :macro :MACRO
               :num :NUMBER
               :rbracket :RBRACKET
               :rcurly :RCURLY
               :rparen :RPAREN
+              :special :SPECIAL
               :str :STRING
-              :sym :SYMBOL
-              :tbl :TABLE
-              :var :VARIABLE
+              :ident :IDENTIFIER
+              :kvpair :KVPAIR_TABLE
               :wild :WILDCARD})
-
-(local bindables {:collect true
-                  :each true
-                  :for true
-                  :icollect true
-                  :lambda true
-                  "λ" true
-                  :let true
-                  :local true
-                  :with-open true})
 
 (local parsers {})
 
@@ -48,28 +35,31 @@
 (fn string? [char]
   (string.find char "[\"']"))
 
-(fn table? [char]
+(fn kvpair-table? [char]
   (string.find char "[%{]"))
 
 (fn wildcard? [char]
-  (string.find char "[_]"))
+  (string.find char "^[_]$"))
 
-(fn symbol? [char]
-  "Does a token not meet one of the above conditions?"
-  (string.find char "[^%(%)%[%]\"'_%d%s%{%}]"))
+(fn identifier? [char]
+  "Character that is not a paren, bracket, quote or space"
+  (string.find char "[^%(%)%[%]\"\'%s%{%}]"))
 
-(fn keyword? [token]
+(fn special? [token]
   (var found false)
-  (each [_ list (pairs keywords) :until found]
-    (each [_ keyword (ipairs list)]
-      (when (= token keyword)
-        (set found true))))
+  (each [_ special (ipairs keywords.specials) :until found]
+    (when (= special token)
+      (set found true)))
   found)
 
-(fn bindable? [str]
-  (. bindables str))
+(fn macro? [token]
+  (var found false)
+  (each [_ mac (ipairs keywords.macros) :until found]
+    (when (= token mac)
+      (set found true)))
+  found)
 
-(fn parsers.create-token [tokens line col type token]
+(fn parsers.create-token [tokens token line col type]
   (doto tokens
     (table.insert {: line :column (- col (length token)) : type : token})))
 
@@ -81,44 +71,59 @@
                      "}" types.rcurly
                      "[" types.lbracket
                      "]" types.rbracket)]
-    (->> (parsers.create-token tokens char line col paren-type)
-         (parsers.begin text (+ pos 1) (+ col 1) line))))
+    (parsers.next text pos col 1 line tokens char paren-type)))
 
 (fn parsers.tokenize-string [text pos col line tokens str-token]
   (match (string.sub text pos pos)
     (where str (string? str))
-    (->> (parsers.create-token tokens str-token line col types.str)
-         (parsers.begin text (+ pos 1) (+ col 1) line))
+    (parsers.next text pos col 1 line tokens str-token types.str)
     char (parsers.tokenize-string text (+ pos 1) (+ col 1) line tokens
                                   (.. str-token char))))
 
 (fn parsers.tokenize-number [text pos col line tokens str-token]
   (match (string.sub text pos pos)
     (where char (not (number? char)))
-    (->> (parsers.create-token tokens str-token line col types.num)
-         (parsers.begin text (+ pos 1) (+ col 1) line))
+    (parsers.next text pos col 1 line tokens str-token types.num)
     num (parsers.tokenize-number text (+ pos 1) (+ col 1) line tokens
                                  (.. str-token num))))
 
-(fn parsers.tokenize-table [text pos col line tokens str-token]
+(fn parsers.tokenize-kvpair [text pos col line tokens str-token]
   (match (string.sub text pos pos)
-    "}" (->> (parsers.create-token tokens (.. str-token "}") line col types.tbl)
-             (parsers.begin text (+ pos 1) (+ col 1) line))
-    tbl (parsers.tokenize-table text (+ pos 1) (+ col 1) line tokens
-                                (.. str-token tbl))))
+    "}" (parsers.next text pos col 1 line tokens (.. str-token "}")
+                      types.kvpair)
+    tbl (parsers.tokenize-kvpair text (+ pos 1) (+ col 1) line tokens
+                                 (.. str-token tbl))))
 
-(fn parsers.tokenize-symbol [text pos col line tokens str-token]
+;; fnlfmt: skip
+(fn parsers.tokenize-identifier [text pos col line tokens str-token]
   (match (string.sub text pos pos)
-    (where sym (not (symbol? sym)))
-    (->> (parsers.create-token tokens str-token line col types.sym)
-         (parsers.begin text pos col line))
-    char (parsers.tokenize-symbol text (+ pos 1) (+ col 1) line tokens
-                                  (.. str-token char))))
+    (where ident (not (identifier? ident)))
+    (if (macro? str-token)
+        (parsers.next text pos col 1 line tokens str-token types.macro)
+        (special? str-token)
+        (parsers.next text pos col 1 line tokens str-token types.special)
+        (wildcard? str-token)
+        (parsers.next text pos col 1 line tokens str-token types.wild)
+        (string.find str-token "^:[%w%d%-_]+$") ;; Match a "string" identifier i.e. :hello, :new-weapon-2, :new_item-3
+        (parsers.next text pos col 0 line tokens str-token types.str)
+        (paren-or-bracket? ident) ;; Special case where closing parens or bracket  were being skipped over
+        (->> (parsers.create-token tokens str-token line col types.ident)
+             (parsers.tokenize-parens text ident pos col line))
+        (parsers.next text pos col 1 line tokens str-token types.ident))
+    char
+    (parsers.tokenize-identifier text (+ pos 1) (+ col 1) line tokens
+                                 (.. str-token char))))
+
+(fn parsers.next [text pos col next-count line tokens token token-type]
+  (let [next-pos (+ pos next-count)
+        next-col (+ col next-count)]
+    (->> (parsers.create-token tokens token line col token-type)
+         (parsers.begin text next-pos next-col line))))
 
 (fn parsers.base [text pos col line tokens]
   (match (string.sub text pos pos)
     "" tokens
-    "\n" (parsers.begin text (+ pos 1) 0 (+ line 1) tokens)
+    "\n" (parsers.begin text (+ pos 1) 1 (+ line 1) tokens)
     (where spc (space? spc)) (parsers.begin text (+ pos 1) (+ col 1) line
                                             tokens)
     (where paren (paren-or-bracket? paren))
@@ -127,10 +132,10 @@
     (parsers.tokenize-string text (+ pos 1) (+ col 1) line tokens "")
     (where num (number? num)) (parsers.tokenize-number text pos col line tokens
                                                        "")
-    (where tbl (table? tbl)) (parsers.tokenize-table text pos col line tokens
-                                                     "")
-    (where sym (symbol? sym)) (parsers.tokenize-symbol text pos col line tokens
-                                                       "")
+    (where tbl (kvpair-table? tbl))
+    (parsers.tokenize-kvpair text pos col line tokens "")
+    (where ident (identifier? ident))
+    (parsers.tokenize-identifier text pos col line tokens "")
     _ (parsers.begin text (+ pos 1) (+ col 1) line tokens)))
 
 (fn parsers.begin [text pos col line tokens]
